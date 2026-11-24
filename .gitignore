@@ -1,0 +1,9 @@
+# Compiled and temporary application files
+*.pdb
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# Personal library data and generated covers
+data/
+covers/
