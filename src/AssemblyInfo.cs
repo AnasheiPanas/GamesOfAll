@@ -2,9 +2,9 @@
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 
-[assembly: AssemblyTitle("GamesOfAll")]
-[assembly: AssemblyDescription("Launcher unificado de Steam, Epic, Riot y juegos locales")]
-[assembly: AssemblyProduct("GamesOfAll")]
+[assembly: AssemblyTitle("Games")]
+[assembly: AssemblyDescription("Launcher unificado de juegos de Steam, Epic, Riot, locales y emulados")]
+[assembly: AssemblyProduct("Games")]
 [assembly: AssemblyCompany("")]
 [assembly: AssemblyCopyright("")]
 [assembly: ComVisible(false)]

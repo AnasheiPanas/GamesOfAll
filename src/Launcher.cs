@@ -44,6 +44,11 @@ namespace GamesOfAll
             }
 
             string rom = g.RomPath ?? "";
+            if (string.IsNullOrEmpty(rom) || !File.Exists(rom))
+            {
+                error = "No se encontró la ROM o ISO asociada a este juego.";
+                return false;
+            }
             string args = g.LaunchArgs;
             if (string.IsNullOrEmpty(args)) args = "{rom}";
 
@@ -63,9 +68,13 @@ namespace GamesOfAll
 
         private static string ReplaceNoCase(string text, string search, string replacement)
         {
-            int index = text.IndexOf(search, StringComparison.OrdinalIgnoreCase);
-            if (index < 0) return text;
-            return text.Substring(0, index) + replacement + text.Substring(index + search.Length);
+            int index = 0;
+            while ((index = text.IndexOf(search, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                text = text.Substring(0, index) + replacement + text.Substring(index + search.Length);
+                index += replacement.Length;
+            }
+            return text;
         }
 
         private static bool OpenUri(string uri, out string error)        {

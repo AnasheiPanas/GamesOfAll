@@ -16,7 +16,9 @@ namespace GamesOfAll
         public bool IsNew;
         public long PlaySeconds;
 
-        private bool hover;
+        private float hoverProgress;
+        private float hoverTarget;
+        private readonly Timer hoverTimer;
 
         public event EventHandler Activated;
 
@@ -29,10 +31,31 @@ namespace GamesOfAll
             Cursor = Cursors.Hand;
             TabStop = true;
             BackColor = Theme.Bg;
+            hoverTimer = new Timer();
+            hoverTimer.Interval = 15;
+            hoverTimer.Tick += HoverTimer_Tick;
         }
 
-        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
-        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseEnter(EventArgs e) { SetHover(true); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { SetHover(false); base.OnMouseLeave(e); }
+
+        private void SetHover(bool value)
+        {
+            hoverTarget = value ? 1f : 0f;
+            if (!hoverTimer.Enabled) hoverTimer.Start();
+        }
+
+        private void HoverTimer_Tick(object sender, EventArgs e)
+        {
+            float delta = hoverTarget - hoverProgress;
+            if (Math.Abs(delta) < 0.04f)
+            {
+                hoverProgress = hoverTarget;
+                hoverTimer.Stop();
+            }
+            else hoverProgress += delta * 0.16f;
+            Invalidate();
+        }
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
@@ -57,6 +80,7 @@ namespace GamesOfAll
                 try { Cover.Dispose(); } catch { }
                 Cover = null;
             }
+            if (disposing) hoverTimer.Dispose();
             base.Dispose(disposing);
         }
 
@@ -69,13 +93,14 @@ namespace GamesOfAll
 
             RectangleF rect = new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f);
             float radius = Theme.Pxf(12f);
-            bool active = hover || IsSelected;
-
-            Theme.FillRound(g, rect, radius, active ? Theme.SurfaceHover : Theme.Surface);
+            Color surface = IsSelected ? Theme.SurfaceHover :
+                Theme.Blend(Theme.Surface, Theme.SurfaceHover, hoverProgress);
+            Theme.FillRound(g, rect, radius, surface);
 
             RectangleF coverRect = new RectangleF(1f, 1f, Width - 2f, Height - 2f);
             using (GraphicsPath clip = Theme.Round(coverRect, radius - 1f))
             {
+                GraphicsState state = g.Save();
                 g.SetClip(clip, CombineMode.Intersect);
                 if (Cover != null)
                 {
@@ -95,12 +120,12 @@ namespace GamesOfAll
                     g.FillRectangle(shade, 0, shadeTop, Width, Height - shadeTop);
                 }
 
-                if (hover)
+                if (hoverProgress > 0.01f)
                 {
-                    using (SolidBrush dim = new SolidBrush(Color.FromArgb(60, 4, 6, 10)))
+                    using (SolidBrush dim = new SolidBrush(Color.FromArgb((int)(52 * hoverProgress), 4, 6, 10)))
                         g.FillRectangle(dim, coverRect);
                 }
-                g.ResetClip();
+                g.Restore(state);
             }
 
             // Titulo
@@ -163,25 +188,30 @@ namespace GamesOfAll
             }
 
             // Accion al pasar el raton
-            if (hover)
+            if (hoverProgress > 0.01f)
             {
                 int pillW = Theme.Px(108);
                 int pillH = Theme.Px(34);
-                RectangleF pill = new RectangleF((Width - pillW) / 2f, (Height - pillH) / 2f - Theme.Px(10), pillW, pillH);
+                float pillY = (Height - pillH) / 2f - Theme.Px(10) + Theme.Px(7) * (1f - hoverProgress);
+                RectangleF pill = new RectangleF((Width - pillW) / 2f, pillY, pillW, pillH);
                 using (SolidBrush shadow = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
                 {
                     using (GraphicsPath sp = Theme.Round(new RectangleF(pill.X + 1, pill.Y + 2, pill.Width, pill.Height), pillH / 2f))
                         g.FillPath(shadow, sp);
                 }
-                Theme.FillRoundGradient(g, pill, pillH / 2f, Theme.Accent, Theme.AccentDeep);
-                TextRenderer.DrawText(g, "\u25B6   Jugar", Theme.SmallBold,
-                    Rectangle.Round(pill), Color.FromArgb(8, 12, 18),
+                int pillAlpha = Math.Max(1, Math.Min(255, (int)(255 * hoverProgress)));
+                Theme.FillRoundGradient(g, pill, pillH / 2f,
+                    Color.FromArgb(pillAlpha, Theme.Accent), Color.FromArgb(pillAlpha, Theme.AccentDeep));
+                TextRenderer.DrawText(g, "Ver detalles", Theme.SmallBold,
+                    Rectangle.Round(pill), Color.FromArgb(pillAlpha, 8, 12, 18),
                     TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
                     TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
             }
 
-            if (IsSelected)
-                Theme.StrokeRound(g, rect, radius, Color.FromArgb(200, Theme.Accent), 1.8f);
+            int borderAlpha = IsSelected ? 200 : (int)(115 * hoverProgress);
+            if (borderAlpha > 0)
+                Theme.StrokeRound(g, rect, radius, Color.FromArgb(borderAlpha, Theme.Accent),
+                    IsSelected ? 1.8f : 1.2f);
         }
 
         private void DrawFallback(Graphics g, RectangleF rect)

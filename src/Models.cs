@@ -31,6 +31,9 @@ namespace GamesOfAll
         public string CoverSlug;      // pista para buscar caratula en Epic
         public string CustomPlatform; // etiqueta propia: "PS2", "N64", "Minecraft"...
         public string RomPath;        // solo juegos emulados
+        public string EmulatorId;     // referencia al emulador configurado
+        public long SteamPlaySeconds; // tiempo sincronizado desde la caché local de Steam
+        public List<GameAccountStats> AccountStats = new List<GameAccountStats>();
         public long LastPlayed;       // epoch segundos
         public int PlayCount;
 
@@ -88,7 +91,27 @@ namespace GamesOfAll
         public long LastPlayed;
         public int PlayCount;
         public long PlaySeconds;
+        public List<GameAccountStats> AccountStats = new List<GameAccountStats>();
         public string CustomCover;
+        public string Description;
+        public string DescriptionSource;
+        public string DescriptionSourceUrl;
+        public long DescriptionFetchedAt;
+        public string ManualDescription;
+    }
+
+    public class GameAccountStats
+    {
+        public string AccountId;
+        public string AccountName;
+        public long PlaySeconds;
+        public long BaselinePlaySeconds;
+        public long LocalPlaySeconds;
+        public string Rank;
+        public int Level;
+        public string Region;
+        public long UpdatedAt;
+        public long OnlineUpdatedAt;
     }
 
     public class Settings
@@ -103,6 +126,10 @@ namespace GamesOfAll
         public int WindowX = int.MinValue;
         public int WindowY = int.MinValue;
         public int Theme = 0; // 0 oscuro, 1 blanco, 2 rojo y negro
+        public string RiotApiKeyProtected;
+        public string RiotApiRegion;
+        public List<string> IgnoredRiotAccounts = new List<string>();
+        public Dictionary<string, string> IgnoredRiotAccountNames = new Dictionary<string, string>();
         public List<Game> CustomGames = new List<Game>();
         public Dictionary<string, GameState> States = new Dictionary<string, GameState>();
         public List<EmulatorConfig> Emulators = new List<EmulatorConfig>();
@@ -110,6 +137,7 @@ namespace GamesOfAll
 
     public class EmulatorConfig
     {
+        public string Id;
         public string Name;
         public string ExePath;
         public string RomFolder;

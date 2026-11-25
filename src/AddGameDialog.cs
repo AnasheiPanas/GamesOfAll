@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -64,6 +65,8 @@ namespace GamesOfAll
         private readonly PillButton emulatedChip;
         private readonly PillButton addButton;
         private readonly PillButton cancelButton;
+        private readonly ComboBox emulatorChoice;
+        private readonly List<EmulatorConfig> emulatorChoices = new List<EmulatorConfig>();
 
         private GameKind kind = GameKind.Native;
         private bool dragging;
@@ -78,8 +81,9 @@ namespace GamesOfAll
         public string GameRom { get { return romField.Value.Trim().Trim('"'); } }
         public string GameArgs { get { return argsField.Value.Trim(); } }
         public GameKind Kind { get { return kind; } }
+        public string EmulatorId { get; private set; }
 
-        public AddGameDialog(string initialExe)
+        public AddGameDialog(string initialExe, List<EmulatorConfig> emulators)
         {
             Text = "Añadir juego";
             FormBorderStyle = FormBorderStyle.None;
@@ -112,6 +116,25 @@ namespace GamesOfAll
 
             argsField = new TextField("Opcional: -windowed -novid");
 
+            emulatorChoice = new ComboBox();
+            emulatorChoice.DropDownStyle = ComboBoxStyle.DropDownList;
+            emulatorChoice.BackColor = Theme.Surface;
+            emulatorChoice.ForeColor = Theme.Text;
+            emulatorChoice.Items.Add("Configuración manual");
+            if (emulators != null)
+            {
+                foreach (EmulatorConfig emulator in emulators)
+                {
+                    if (emulator == null) continue;
+                    emulatorChoices.Add(emulator);
+                    emulatorChoice.Items.Add(string.IsNullOrEmpty(emulator.Name)
+                        ? "Emulador configurado"
+                        : emulator.Name);
+                }
+            }
+            emulatorChoice.SelectedIndex = 0;
+            emulatorChoice.SelectedIndexChanged += EmulatorChoice_SelectedIndexChanged;
+
             browseExe = new PillButton("Examinar");
             browseExe.Click += delegate { BrowseExe(); };
 
@@ -142,6 +165,7 @@ namespace GamesOfAll
             Controls.Add(romField);
             Controls.Add(browseRom);
             Controls.Add(argsField);
+            Controls.Add(emulatorChoice);
             Controls.Add(addButton);
             Controls.Add(cancelButton);
             Controls.Add(close);
@@ -183,17 +207,28 @@ namespace GamesOfAll
             bool emulated = kind == GameKind.Emulated;
             if (emulated)
             {
+                emulatorChoice.Visible = true;
+                emulatorChoice.SetBounds(margin, Theme.Px(116), width, Theme.Px(30));
                 romField.Visible = true;
                 browseRom.Visible = true;
-                romField.SetBounds(margin, Theme.Px(290), width - browseW - Theme.Px(10), Theme.Px(40));
-                browseRom.SetBounds(romField.Right + Theme.Px(10), Theme.Px(290), browseW, Theme.Px(40));
-                argsField.SetBounds(margin, Theme.Px(366), width, Theme.Px(40));
+                nameField.SetBounds(margin, Theme.Px(178), width - platformW - Theme.Px(12), Theme.Px(40));
+                platformField.SetBounds(margin + width - platformW, Theme.Px(178), platformW, Theme.Px(40));
+                exeField.SetBounds(margin, Theme.Px(246), width - browseW - Theme.Px(10), Theme.Px(40));
+                browseExe.SetBounds(exeField.Right + Theme.Px(10), Theme.Px(246), browseW, Theme.Px(40));
+                romField.SetBounds(margin, Theme.Px(314), width - browseW - Theme.Px(10), Theme.Px(40));
+                browseRom.SetBounds(romField.Right + Theme.Px(10), Theme.Px(314), browseW, Theme.Px(40));
+                argsField.SetBounds(margin, Theme.Px(382), width, Theme.Px(40));
                 ClientSize = new Size(ClientSize.Width, Theme.Px(508));
             }
             else
             {
+                emulatorChoice.Visible = false;
                 romField.Visible = false;
                 browseRom.Visible = false;
+                nameField.SetBounds(margin, Theme.Px(138), width - platformW - Theme.Px(12), Theme.Px(40));
+                platformField.SetBounds(margin + width - platformW, Theme.Px(138), platformW, Theme.Px(40));
+                exeField.SetBounds(margin, Theme.Px(214), width - browseW - Theme.Px(10), Theme.Px(40));
+                browseExe.SetBounds(exeField.Right + Theme.Px(10), Theme.Px(214), browseW, Theme.Px(40));
                 argsField.SetBounds(margin, Theme.Px(290), width, Theme.Px(40));
                 ClientSize = new Size(ClientSize.Width, Theme.Px(424));
             }
@@ -202,6 +237,19 @@ namespace GamesOfAll
             cancelButton.SetBounds(ClientSize.Width - margin - Theme.Px(232), btnY, Theme.Px(112), Theme.Px(38));
             addButton.SetBounds(ClientSize.Width - margin - Theme.Px(112), btnY, Theme.Px(112), Theme.Px(38));
             Invalidate();
+        }
+
+        private void EmulatorChoice_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            EmulatorId = null;
+            int index = emulatorChoice.SelectedIndex - 1;
+            if (index < 0 || index >= emulatorChoices.Count) return;
+
+            EmulatorConfig emulator = emulatorChoices[index];
+            EmulatorId = emulator.Id;
+            exeField.Value = emulator.ExePath ?? "";
+            argsField.Value = string.IsNullOrEmpty(emulator.Arguments) ? "{rom}" : emulator.Arguments;
+            platformField.Value = emulator.Name ?? "";
         }
 
         private void BrowseExe()
@@ -310,13 +358,15 @@ namespace GamesOfAll
                 new Rectangle(Theme.Px(28), Theme.Px(50), ClientSize.Width - Theme.Px(90), Theme.Px(20)),
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
 
-            DrawLabel(g, "Nombre", Theme.Px(120));
-            DrawLabel(g, "Plataforma o etiqueta", Theme.Px(120), Theme.Px(28) + contentWidth - Theme.Px(186));
+            DrawLabel(g, "Nombre", kind == GameKind.Emulated ? Theme.Px(160) : Theme.Px(120));
+            DrawLabel(g, "Plataforma o etiqueta", kind == GameKind.Emulated ? Theme.Px(160) : Theme.Px(120),
+                Theme.Px(28) + contentWidth - Theme.Px(186));
 
-            DrawLabel(g, kind == GameKind.Emulated ? "Emulador (.exe)" : "Ejecutable (.exe)", Theme.Px(196));
-            if (kind == GameKind.Emulated) DrawLabel(g, "ROM / ISO", Theme.Px(272));
-            DrawLabel(g, "Argumentos", Theme.Px(kind == GameKind.Emulated ? 348 : 272));
-
+            DrawLabel(g, kind == GameKind.Emulated ? "Ejecutable del emulador (.exe)" : "Ejecutable (.exe)",
+                kind == GameKind.Emulated ? Theme.Px(228) : Theme.Px(196));
+            if (kind == GameKind.Emulated) DrawLabel(g, "ROM / ISO", Theme.Px(296));
+            DrawLabel(g, "Argumentos (usa {rom}; la ruta se cita automáticamente)",
+                kind == GameKind.Emulated ? Theme.Px(364) : Theme.Px(272));
             using (Pen p = new Pen(Theme.Stroke))
                 g.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
         }

@@ -105,7 +105,179 @@ namespace GamesOfAll
                     catch (Exception ex) { Storage.Log("appmanifest " + manifest + ": " + ex.Message); }
                 }
             }
+
+            ApplySteamPlaytimes(games, ReadSteamAccounts(steamPath));
             return games;
+        }
+
+        public static void RefreshSteamPlaytimes(List<Game> games)
+        {
+            if (games == null) return;
+            string steamPath = FindSteamPath();
+            if (steamPath == null) return;
+            ApplySteamPlaytimes(games, ReadSteamAccounts(steamPath));
+        }
+
+        public static string GetActiveSteamAccountId()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam\ActiveProcess"))
+                {
+                    if (key == null) return null;
+                    object value = key.GetValue("ActiveUser");
+                    if (value == null) return null;
+                    uint accountId = Convert.ToUInt32(value, CultureInfo.InvariantCulture);
+                    return accountId == 0 ? null : accountId.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+            catch (Exception ex)
+            {
+                Storage.Log("No se pudo identificar la cuenta activa de Steam: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static void ApplySteamPlaytimes(List<Game> games, Dictionary<string, Dictionary<string, GameAccountStats>> accounts)
+        {
+            List<string> accountIds = new List<string>(accounts.Keys);
+            accountIds.Sort(StringComparer.OrdinalIgnoreCase);
+            foreach (Game game in games)
+            {
+                if (game.Platform != Platform.Steam) continue;
+                game.AccountStats = new List<GameAccountStats>();
+                game.SteamPlaySeconds = 0;
+                foreach (string accountId in accountIds)
+                {
+                    Dictionary<string, GameAccountStats> account = accounts[accountId];
+                    GameAccountStats profile;
+                    if (!account.TryGetValue("__profile__", out profile)) continue;
+                    GameAccountStats stat;
+                    if (!account.TryGetValue(game.LaunchTarget, out stat))
+                    {
+                        stat = new GameAccountStats();
+                        stat.AccountId = profile.AccountId;
+                        stat.AccountName = profile.AccountName;
+                    }
+                    game.AccountStats.Add(stat);
+                    if (stat.PlaySeconds > long.MaxValue - game.SteamPlaySeconds)
+                        game.SteamPlaySeconds = long.MaxValue;
+                    else
+                        game.SteamPlaySeconds += stat.PlaySeconds;
+                }
+            }
+        }
+
+        private static Dictionary<string, Dictionary<string, GameAccountStats>> ReadSteamAccounts(string steamPath)
+        {
+            Dictionary<string, Dictionary<string, GameAccountStats>> accounts =
+                new Dictionary<string, Dictionary<string, GameAccountStats>>(StringComparer.OrdinalIgnoreCase);
+            string userData = Path.Combine(steamPath, "userdata");
+            if (!Directory.Exists(userData)) return accounts;
+            try
+            {
+                string[] userDirectories = Directory.GetDirectories(userData);
+                Array.Sort(userDirectories, StringComparer.OrdinalIgnoreCase);
+                int unnamedAccount = 0;
+                foreach (string userDirectory in userDirectories)
+                {
+                    string candidate = Path.Combine(userDirectory, "config", "localconfig.vdf");
+                    string accountId = Path.GetFileName(userDirectory);
+                    if (string.IsNullOrEmpty(accountId)) continue;
+                    unnamedAccount++;
+                    accounts[accountId] = new Dictionary<string, GameAccountStats>(StringComparer.OrdinalIgnoreCase);
+                    GameAccountStats profile = new GameAccountStats();
+                    profile.AccountId = accountId;
+                    profile.AccountName = "Cuenta Steam " + unnamedAccount;
+                    accounts[accountId]["__profile__"] = profile;
+                    if (!File.Exists(candidate)) continue;
+
+                    try
+                    {
+                        Dictionary<string, object> root = Vdf.Parse(File.ReadAllText(candidate));
+                        CollectSteamPlaytimes(root, accountId, profile.AccountName, accounts[accountId]);
+                    }
+                    catch (Exception ex)
+                    {
+                        Storage.Log("No se pudieron leer horas de un perfil Steam: " + ex.Message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Storage.Log("No se pudieron leer los perfiles locales de Steam: " + ex.Message);
+            }
+
+            ApplySteamAccountNames(steamPath, accounts);
+            return accounts;
+        }
+
+        private static void ApplySteamAccountNames(string steamPath,
+            Dictionary<string, Dictionary<string, GameAccountStats>> accounts)
+        {
+            string loginUsers = Path.Combine(steamPath, "config", "loginusers.vdf");
+            if (!File.Exists(loginUsers)) return;
+            try
+            {
+                Dictionary<string, object> root = Vdf.Parse(File.ReadAllText(loginUsers));
+                Dictionary<string, object> users = Vdf.GetMap(root, "users");
+                if (users == null) users = root;
+                const long steamIdBase = 76561197960265728L;
+                foreach (KeyValuePair<string, object> entry in users)
+                {
+                    long steamId;
+                    Dictionary<string, object> user = entry.Value as Dictionary<string, object>;
+                    if (user == null || !long.TryParse(entry.Key, out steamId)) continue;
+                    string name = Vdf.GetString(user, "PersonaName");
+                    if (string.IsNullOrWhiteSpace(name) || steamId < steamIdBase) continue;
+                    name = CleanAccountName(name);
+                    if (string.IsNullOrWhiteSpace(name)) continue;
+                    string accountId = (steamId - steamIdBase).ToString(CultureInfo.InvariantCulture);
+                    Dictionary<string, GameAccountStats> games;
+                    if (!accounts.TryGetValue(accountId, out games)) continue;
+                    foreach (GameAccountStats stat in games.Values) stat.AccountName = name.Trim();
+                }
+            }
+            catch (Exception ex)
+            {
+                Storage.Log("No se pudieron leer los nombres de las cuentas de Steam: " + ex.Message);
+            }
+        }
+
+        private static string CleanAccountName(string name)
+        {
+            StringBuilder clean = new StringBuilder();
+            foreach (char character in name)
+            {
+                UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(character);
+                if (category != UnicodeCategory.Control && category != UnicodeCategory.Format)
+                    clean.Append(character);
+            }
+            return clean.ToString().Trim();
+        }
+
+        private static void CollectSteamPlaytimes(Dictionary<string, object> map, string accountId, string accountName,
+            Dictionary<string, GameAccountStats> playtimes)
+        {
+            foreach (KeyValuePair<string, object> entry in map)
+            {
+                Dictionary<string, object> child = entry.Value as Dictionary<string, object>;
+                if (child == null) continue;
+
+                long appId;
+                long minutes;
+                if (long.TryParse(entry.Key, out appId) &&
+                    long.TryParse(Vdf.GetString(child, "Playtime"), out minutes) &&
+                    minutes > 0 && minutes <= long.MaxValue / 60)
+                {
+                    GameAccountStats stat = new GameAccountStats();
+                    stat.AccountId = accountId;
+                    stat.AccountName = accountName;
+                    stat.PlaySeconds = minutes * 60;
+                    playtimes[entry.Key] = stat;
+                }
+                CollectSteamPlaytimes(child, accountId, accountName, playtimes);
+            }
         }
 
         private static Game ReadSteamManifest(string manifestPath, string steamappsDir)

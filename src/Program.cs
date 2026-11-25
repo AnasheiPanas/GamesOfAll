@@ -27,7 +27,7 @@ namespace GamesOfAll
             {
                 if (!createdNew)
                 {
-                    MessageBox.Show("GamesOfAll ya está abierto.", "GamesOfAll",
+                    MessageBox.Show("Games ya está abierto.", "Games",
                         MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
@@ -76,7 +76,7 @@ namespace GamesOfAll
             {
                 MessageBox.Show("Ha ocurrido un error inesperado:\n\n" + ex.Message +
                     "\n\nSe guardó el detalle en data\\gamesofall.log",
-                    "GamesOfAll", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    "Games", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             catch { }
         }

@@ -40,6 +40,9 @@ namespace GamesOfAll
                 if (s.IgnoredPaths == null) s.IgnoredPaths = new List<string>();
                 if (s.States == null) s.States = new Dictionary<string, GameState>(StringComparer.OrdinalIgnoreCase);
                 if (s.Emulators == null) s.Emulators = new List<EmulatorConfig>();
+                if (s.IgnoredRiotAccounts == null) s.IgnoredRiotAccounts = new List<string>();
+                if (s.IgnoredRiotAccountNames == null)
+                    s.IgnoredRiotAccountNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 return s;
             }
             catch (Exception ex)

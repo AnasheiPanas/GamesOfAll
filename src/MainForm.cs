@@ -22,13 +22,26 @@ namespace GamesOfAll
         private bool coverWorkerRunning;
 
         private readonly Dictionary<string, DateTime> runningSince = new Dictionary<string, DateTime>();
+        private readonly Dictionary<string, GameAccountStats> runningAccounts =
+            new Dictionary<string, GameAccountStats>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, GameAccountStats> runningSteamAccounts =
+            new Dictionary<string, GameAccountStats>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<string>> processHintCache = new Dictionary<string, List<string>>();
         private readonly HashSet<string> newIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> riotLookupsInProgress = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, DateTime> lastRiotLookupAttempt =
+            new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        private readonly object riotLookupLock = new object();
+        private bool riotApiKeyNoticeShown;
+        private GameAccountStats latestRiotAccount;
+        private DateTime lastRiotProfileRefresh = DateTime.MinValue;
 
         private GridPanel grid;
         private Panel topBar;
         private Panel filtersBar;
         private Panel bottomBar;
+        private GameDetailsPanel detailsPanel;
+        private LoadingOverlay loadingOverlay;
         private SearchBox search;
         private PillButton addButton;
         private PillButton statsButton;
@@ -50,7 +63,7 @@ namespace GamesOfAll
         private string filter = "all";
         private bool favoritesOnly;
         private string selectedId;
-        private string defaultHint = "Clic para jugar  ·  Clic derecho para más opciones";
+        private string defaultHint = "Clic para ver detalles  ·  Clic derecho para más opciones";
 
         private System.Windows.Forms.Timer reorderTimer;
         private System.Windows.Forms.Timer statusTimer;
@@ -67,7 +80,7 @@ namespace GamesOfAll
             Storage.EnsureFolders();
             Theme.Apply(settings.Theme);
 
-            Text = "GamesOfAll";
+            Text = "Games";
             FormBorderStyle = FormBorderStyle.None;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Theme.Bg;
@@ -101,6 +114,7 @@ namespace GamesOfAll
 
             Shown += delegate
             {
+                if (loadingOverlay != null) loadingOverlay.StartAnimation();
                 StartScan();
                 StartPlaytimeWatcher();
             };
@@ -183,7 +197,7 @@ namespace GamesOfAll
             chipEpic = MakeChip("Epic", "Epic");
             chipRiot = MakeChip("Riot", "Riot");
             chipLocal = MakeChip("Locales", "Local");
-            chipEmulated = MakeChip("Emulados", "Emulated");
+            chipEmulated = MakeChip("Emuladores", "Emulated");
 
             chipFav = new PillButton("Favoritos");
             chipFav.Icon = "\uE734";
@@ -229,6 +243,15 @@ namespace GamesOfAll
             Controls.Add(topBar);
             Controls.Add(filtersBar);
             Controls.Add(bottomBar);
+            loadingOverlay = new LoadingOverlay();
+            loadingOverlay.Dismissed += delegate
+            {
+                Controls.Remove(loadingOverlay);
+                loadingOverlay.Dispose();
+                loadingOverlay = null;
+            };
+            Controls.Add(loadingOverlay);
+            loadingOverlay.BringToFront();
 
             chipAll.Selected = true;
             UpdateSortButton();
@@ -265,6 +288,8 @@ namespace GamesOfAll
             filtersBar.SetBounds(0, topH, w, filtersH);
             bottomBar.SetBounds(0, h - bottomH, w, bottomH);
             grid.SetBounds(0, topH + filtersH, w, Math.Max(0, h - topH - filtersH - bottomH));
+            if (detailsPanel != null) detailsPanel.Bounds = grid.Bounds;
+            if (loadingOverlay != null) loadingOverlay.Bounds = ClientRectangle;
 
             int y = (topH - Theme.Px(38)) / 2;
             int right = w - Theme.Px(14);
@@ -292,7 +317,7 @@ namespace GamesOfAll
         {
             int x = Theme.Px(26);
             int y = (Theme.Px(54) - Theme.Px(32)) / 2;
-            PillButton[] chips = { chipAll, chipSteam, chipEpic, chipRiot, chipLocal, chipFav };
+            PillButton[] chips = { chipAll, chipSteam, chipEpic, chipRiot, chipLocal, chipEmulated, chipFav };
             foreach (PillButton chip in chips)
             {
                 int width = ChipWidth(chip);
@@ -354,7 +379,7 @@ namespace GamesOfAll
             }
 
             int textX = (int)logo.Right + Theme.Px(11);
-            DrawTracked(g, "GamesOfAll", Theme.Logo, Theme.Text, textX, Theme.Px(16), Theme.Pxf(0.7f));
+            DrawTracked(g, "Games", Theme.Logo, Theme.Text, textX, Theme.Px(16), Theme.Pxf(0.7f));
             DrawTracked(g, "Launcher", Theme.Small, Theme.TextFaint, textX + Theme.Px(1), Theme.Px(40), Theme.Pxf(1.4f));
         }
 
@@ -420,12 +445,14 @@ namespace GamesOfAll
             foreach (Game g in games) StateOf(g);
 
             RefreshGrid();
+            RefreshKnownRiotAccountsOnline();
             hintText.Text = games.Count == 0
                 ? "No se encontraron juegos. Usa «Añadir juego»."
                 : defaultHint;
 
             foreach (Game g in games) QueueCover(g);
             StartAutoDiscovery();
+            if (loadingOverlay != null) loadingOverlay.Dismiss();
         }
 
         private GameState StateOf(Game g)
@@ -436,6 +463,7 @@ namespace GamesOfAll
                 st = new GameState();
                 settings.States[g.Id] = st;
             }
+            if (st.AccountStats == null) st.AccountStats = new List<GameAccountStats>();
             if (g.LastPlayed > st.LastPlayed) st.LastPlayed = g.LastPlayed;
             return st;
         }
@@ -470,7 +498,7 @@ namespace GamesOfAll
                 GameCard card = new GameCard(g);
                 card.IsFavorite = st.Favorite;
                 card.IsNew = newIds.Contains(g.Id);
-                card.PlaySeconds = st.PlaySeconds;
+                card.PlaySeconds = GetPlaySeconds(g, st);
                 card.Cover = Covers.Load(g, st);
                 card.Activated += Card_Activated;
                 card.MouseUp += Card_MouseUp;
@@ -516,6 +544,15 @@ namespace GamesOfAll
                     grid.EmptyText = "Todavía no tienes favoritos";
                     grid.EmptyHint = "Clic derecho en un juego → Marcar como favorito";
                 }
+                else if (filter == "Emulated")
+                {
+                    grid.EmptyText = "Todavía no hay juegos emulados";
+                    grid.EmptyHint = settings.Emulators.Count == 0
+                        ? "Configura tu primer emulador en Ajustes → Emuladores"
+                        : settings.Emulators.Count + (settings.Emulators.Count == 1
+                            ? " emulador configurado · añade una ROM o carpeta de juegos"
+                            : " emuladores configurados · añade una ROM o carpeta de juegos");
+                }
                 else if (games.Count > 0)
                 {
                     grid.EmptyText = "No hay juegos en este filtro";
@@ -540,7 +577,7 @@ namespace GamesOfAll
 
             if (settings.SortMode == 2)
             {
-                int played = sb.PlaySeconds.CompareTo(sa.PlaySeconds);
+                int played = GetPlaySeconds(b, sb).CompareTo(GetPlaySeconds(a, sa));
                 if (played != 0) return played;
             }
             else if (settings.SortMode == 0)
@@ -591,7 +628,7 @@ namespace GamesOfAll
             {
                 selectedId = card.Game.Id;
                 grid.SetAmbient(card.Cover);
-                Launch(card.Game);
+                ShowGameDetails(card.Game);
             }
         }
 
@@ -606,6 +643,7 @@ namespace GamesOfAll
 
         private void Launch(Game g)
         {
+            SyncEmulatorConfig(g);
             string error;
             if (!GameLauncher.Launch(g, out error))
             {
@@ -630,6 +668,37 @@ namespace GamesOfAll
             reorderTimer.Start();
         }
 
+        private void ShowGameDetails(Game game)
+        {
+            if (game == null) return;
+            CloseGameDetails();
+            GameState state = StateOf(game);
+            detailsPanel = new GameDetailsPanel(game, state, GetPlaySeconds(game, state),
+                GetAccountStats(game, state), SaveSettings);
+            detailsPanel.PlayRequested += delegate
+            {
+                CloseGameDetails();
+                Launch(game);
+            };
+            detailsPanel.CloseRequested += delegate { CloseGameDetails(); };
+            detailsPanel.Bounds = grid.Bounds;
+            Controls.Add(detailsPanel);
+            detailsPanel.BringToFront();
+            detailsPanel.Focus();
+            detailsPanel.BeginLookup();
+        }
+
+        private void CloseGameDetails()
+        {
+            if (detailsPanel == null) return;
+            GameDetailsPanel closing = detailsPanel;
+            detailsPanel = null;
+            Controls.Remove(closing);
+            closing.Dispose();
+            GameCard card = grid.FindCard(selectedId);
+            if (card != null) card.Focus();
+        }
+
         private void ShowGameMenu(GameCard card)
         {
             Game g = card.Game;
@@ -651,7 +720,8 @@ namespace GamesOfAll
             });
 
             Menus.Separator(menu);
-            string timeText = st.PlaySeconds >= 60 ? Fmt.Playtime(st.PlaySeconds) + " jugadas" : "Sin horas registradas";
+            long playSeconds = GetPlaySeconds(g, st);
+            string timeText = playSeconds >= 60 ? Fmt.Playtime(playSeconds) + " jugadas" : "Sin horas registradas";
             ToolStripMenuItem info = Menus.Item(menu, "   " + timeText, null);
             info.Enabled = false;
 
@@ -738,18 +808,21 @@ namespace GamesOfAll
 
         private void AddGameDialogFlow()
         {
-            using (AddGameDialog dlg = new AddGameDialog(""))
+            EnsureEmulatorIds();
+            using (AddGameDialog dlg = new AddGameDialog("", settings.Emulators))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 bool added = AddLocalGame(dlg.GameName, dlg.GameExe, dlg.GameArgs,
-                    Path.GetDirectoryName(dlg.GameExe), dlg.Kind, dlg.GameRom, dlg.PlatformLabel);
+                    Path.GetDirectoryName(dlg.GameExe), dlg.Kind, dlg.GameRom, dlg.PlatformLabel,
+                    dlg.EmulatorId);
+                if (!added) SaveSettings();
                 if (added) hintText.Text = "«" + (dlg.GameName.Length > 0 ? dlg.GameName : Path.GetFileNameWithoutExtension(dlg.GameExe)) + "» añadido.";
                 else hintText.Text = "Ese juego ya está en la biblioteca.";
             }
         }
 
         private bool AddLocalGame(string title, string exe, string args, string installDir,
-            GameKind kind, string rom, string platformLabel)
+            GameKind kind, string rom, string platformLabel, string emulatorId = null)
         {
             if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) return false;
 
@@ -758,7 +831,15 @@ namespace GamesOfAll
 
             foreach (Game g in games)
             {
-                if (string.Equals(g.Id, id, StringComparison.OrdinalIgnoreCase)) return false;
+                bool sameGame = string.Equals(g.Id, id, StringComparison.OrdinalIgnoreCase) ||
+                    (kind == GameKind.Emulated && !string.IsNullOrEmpty(rom) &&
+                     string.Equals(g.RomPath, rom, StringComparison.OrdinalIgnoreCase));
+                if (sameGame)
+                {
+                    if (kind == GameKind.Emulated)
+                        UpdateEmulatorLink(g, exe, args, installDir, platformLabel, emulatorId);
+                    return false;
+                }
                 if (kind == GameKind.Native && !string.IsNullOrEmpty(g.Executable) &&
                     string.Equals(g.Executable, exe, StringComparison.OrdinalIgnoreCase)) return false;
             }
@@ -775,6 +856,7 @@ namespace GamesOfAll
             game.InstallDir = string.IsNullOrEmpty(installDir) ? Path.GetDirectoryName(exe) : installDir;
             game.CustomPlatform = string.IsNullOrEmpty(platformLabel) ? null : platformLabel.Trim();
             game.RomPath = rom;
+            game.EmulatorId = emulatorId;
 
             settings.CustomGames.Add(game);
             games.Add(game);
@@ -786,6 +868,64 @@ namespace GamesOfAll
             RefreshGrid();
             QueueCover(game);
             return true;
+        }
+
+        private bool UpdateEmulatorLink(Game game, string exe, string args, string installDir,
+            string platformLabel, string emulatorId)
+        {
+            bool changed = false;
+            if (!string.Equals(game.Executable, exe, StringComparison.OrdinalIgnoreCase))
+            {
+                game.Executable = exe;
+                game.LaunchTarget = exe;
+                game.IconSource = exe;
+                changed = true;
+            }
+            if (!string.Equals(game.LaunchArgs, args, StringComparison.Ordinal))
+            {
+                game.LaunchArgs = args;
+                changed = true;
+            }
+            if (!string.Equals(game.InstallDir, installDir, StringComparison.OrdinalIgnoreCase))
+            {
+                game.InstallDir = installDir;
+                changed = true;
+            }
+            if (!string.Equals(game.CustomPlatform, platformLabel, StringComparison.Ordinal))
+            {
+                game.CustomPlatform = platformLabel;
+                changed = true;
+            }
+            if (!string.Equals(game.EmulatorId, emulatorId, StringComparison.OrdinalIgnoreCase))
+            {
+                game.EmulatorId = emulatorId;
+                changed = true;
+            }
+            return changed;
+        }
+
+        private void SyncEmulatorConfig(Game game)
+        {
+            if (game == null || !game.IsEmulated) return;
+            EmulatorConfig selected = null;
+            foreach (EmulatorConfig emulator in settings.Emulators)
+            {
+                if (!string.IsNullOrEmpty(game.EmulatorId) &&
+                    string.Equals(emulator.Id, game.EmulatorId, StringComparison.OrdinalIgnoreCase))
+                {
+                    selected = emulator;
+                    break;
+                }
+                if (selected == null && !string.IsNullOrEmpty(emulator.ExePath) &&
+                    string.Equals(emulator.ExePath, game.Executable, StringComparison.OrdinalIgnoreCase))
+                    selected = emulator;
+            }
+            if (selected == null) return;
+
+            UpdateEmulatorLink(game, selected.ExePath,
+                string.IsNullOrEmpty(selected.Arguments) ? "{rom}" : selected.Arguments,
+                Path.GetDirectoryName(selected.ExePath),
+                string.IsNullOrEmpty(selected.Name) ? "Emulado" : selected.Name, selected.Id);
         }
 
         private static string StableHash(string text)
@@ -931,12 +1071,13 @@ namespace GamesOfAll
             foreach (Game g in games)
             {
                 GameState st = StateOf(g);
-                if (st.PlaySeconds < 60) continue;
-                totalSeconds += st.PlaySeconds;
+                long playSeconds = GetPlaySeconds(g, st);
+                if (playSeconds < 60) continue;
+                totalSeconds += playSeconds;
                 StatEntry entry = new StatEntry();
                 entry.Title = g.Title;
                 entry.Platform = g.PlatformName;
-                entry.PlaySeconds = st.PlaySeconds;
+                entry.PlaySeconds = playSeconds;
                 entry.LastPlayed = st.LastPlayed;
                 entry.PlayCount = st.PlayCount;
                 entry.Cover = Covers.Load(g, st);
@@ -995,6 +1136,21 @@ namespace GamesOfAll
             DateTime now = DateTime.Now;
             bool changed = false;
 
+            Game league = FindLeagueGame();
+            if (league != null &&
+                (running.Contains("leagueclientux") || running.Contains("leagueclient")) &&
+                (now - lastRiotProfileRefresh).TotalSeconds >= 60)
+            {
+                lastRiotProfileRefresh = now;
+                GameAccountStats profile = ReadRiotAccount(league);
+                if (profile != null)
+                {
+                    latestRiotAccount = profile;
+                    if (UpdateRiotAccountStats(league, profile, 0)) changed = true;
+                    QueueRiotOnlineLookup(profile, false);
+                }
+            }
+
             foreach (Game g in games)
             {
                 bool active = false;
@@ -1007,17 +1163,51 @@ namespace GamesOfAll
                 if (active && !tracked)
                 {
                     runningSince[g.Id] = now;
+                    if (g.Platform == Platform.Steam)
+                    {
+                        Scanner.RefreshSteamPlaytimes(games);
+                        GameAccountStats account = PrepareSteamAccount(g);
+                        if (account != null) runningSteamAccounts[g.Id] = account;
+                        UpdateCardPlaytime(g.Id);
+                    }
+                    else if (g.Platform == Platform.Riot)
+                    {
+                        GameAccountStats profile = ReadRiotAccount(g);
+                        if (profile == null && latestRiotAccount != null)
+                            profile = CopyAccountStats(latestRiotAccount);
+                        if (profile != null)
+                        {
+                            runningAccounts[g.Id] = profile;
+                            if (UpdateRiotAccountStats(g, profile, 0)) changed = true;
+                            QueueRiotOnlineLookup(profile, true);
+                        }
+                    }
                 }
                 else if (!active && tracked)
                 {
                     DateTime start = runningSince[g.Id];
                     runningSince.Remove(g.Id);
+                    GameAccountStats account = null;
+                    if (g.Platform == Platform.Riot)
+                    {
+                        GameAccountStats current = ReadRiotAccount(g);
+                        runningAccounts.TryGetValue(g.Id, out account);
+                        account = MergeRiotSessionAccount(account, current);
+                        runningAccounts.Remove(g.Id);
+                    }
+                    else if (g.Platform == Platform.Steam)
+                    {
+                        runningSteamAccounts.TryGetValue(g.Id, out account);
+                        runningSteamAccounts.Remove(g.Id);
+                    }
                     long seconds = (long)(now - start).TotalSeconds;
                     if (seconds >= 15)
                     {
-                        GameState st = StateOf(g);
-                        st.PlaySeconds += seconds;
+                        RecordGameSession(g, seconds, account);
                         changed = true;
+                        if (g.Platform == Platform.Riot && account != null)
+                            QueueRiotOnlineLookup(account, true);
+                        if (g.Platform == Platform.Steam) Scanner.RefreshSteamPlaytimes(games);
                         UpdateCardPlaytime(g.Id);
                     }
                 }
@@ -1036,6 +1226,12 @@ namespace GamesOfAll
             if (processHintCache.TryGetValue(g.Id, out cached)) return cached;
 
             List<string> hints = g.ProcessHints();
+            if (g.Platform == Platform.Riot &&
+                string.Equals(g.LaunchTarget, "league_of_legends", StringComparison.OrdinalIgnoreCase))
+            {
+                hints.Clear();
+                hints.Add("league of legends");
+            }
             if (hints.Count == 0 && !string.IsNullOrEmpty(g.InstallDir) && Directory.Exists(g.InstallDir))
             {
                 try
@@ -1054,8 +1250,390 @@ namespace GamesOfAll
             GameCard card = grid.FindCard(id);
             if (card == null) return;
             GameState st = StateOf(card.Game);
-            card.PlaySeconds = st.PlaySeconds;
+            card.PlaySeconds = GetPlaySeconds(card.Game, st);
             card.Invalidate();
+        }
+
+        private long GetPlaySeconds(Game game, GameState state)
+        {
+            if (game.Platform == Platform.Riot && state.AccountStats.Count > 0)
+            {
+                long accountTotal = 0;
+                foreach (GameAccountStats account in state.AccountStats)
+                {
+                    if (account == null || string.IsNullOrWhiteSpace(account.AccountId)) continue;
+                    if (IsRiotAccountIgnored(account.AccountId)) continue;
+                    long seconds = Math.Max(0, account.PlaySeconds);
+                    if (accountTotal > long.MaxValue - seconds) return long.MaxValue;
+                    accountTotal += seconds;
+                }
+                return accountTotal;
+            }
+            if (game.Platform != Platform.Steam) return state.PlaySeconds;
+            long total = 0;
+            foreach (GameAccountStats account in GetAccountStats(game, state))
+            {
+                if (account.PlaySeconds > long.MaxValue - total) return long.MaxValue;
+                total += account.PlaySeconds;
+            }
+            return Math.Max(state.PlaySeconds, total);
+        }
+
+        private IList<GameAccountStats> GetAccountStats(Game game, GameState state)
+        {
+            if (game.Platform == Platform.Steam)
+            {
+                List<GameAccountStats> combined = new List<GameAccountStats>();
+                if (game.AccountStats != null)
+                {
+                    foreach (GameAccountStats native in game.AccountStats)
+                    {
+                        GameAccountStats account = CopyAccountStats(native);
+                        GameAccountStats local = FindAccount(state.AccountStats, native.AccountId);
+                        if (local != null)
+                        {
+                            account.BaselinePlaySeconds = local.BaselinePlaySeconds;
+                            account.LocalPlaySeconds = local.LocalPlaySeconds;
+                            if (!string.IsNullOrWhiteSpace(local.AccountName)) account.AccountName = local.AccountName;
+                            long locallyTracked = AddSeconds(local.BaselinePlaySeconds, local.LocalPlaySeconds);
+                            account.PlaySeconds = Math.Max(account.PlaySeconds, locallyTracked);
+                        }
+                        combined.Add(account);
+                    }
+                }
+                foreach (GameAccountStats local in state.AccountStats)
+                {
+                    bool found = false;
+                    foreach (GameAccountStats native in combined)
+                        if (string.Equals(native.AccountId, local.AccountId, StringComparison.OrdinalIgnoreCase))
+                        { found = true; break; }
+                    if (found) continue;
+                    GameAccountStats account = CopyAccountStats(local);
+                    account.PlaySeconds = AddSeconds(local.BaselinePlaySeconds, local.LocalPlaySeconds);
+                    combined.Add(account);
+                }
+                return combined;
+            }
+            if (game.Platform == Platform.Riot)
+            {
+                List<GameAccountStats> visible = new List<GameAccountStats>();
+                foreach (GameAccountStats account in state.AccountStats)
+                    if (account != null && !IsRiotAccountIgnored(account.AccountId))
+                        visible.Add(account);
+                return visible;
+            }
+            return state.AccountStats;
+        }
+
+        private GameAccountStats PrepareSteamAccount(Game game)
+        {
+            string accountId = Scanner.GetActiveSteamAccountId();
+            if (string.IsNullOrWhiteSpace(accountId)) return null;
+
+            GameAccountStats native = FindAccount(game.AccountStats, accountId);
+            GameState state = StateOf(game);
+            GameAccountStats local = FindAccount(state.AccountStats, accountId);
+            if (local == null)
+            {
+                local = new GameAccountStats();
+                local.AccountId = accountId;
+                state.AccountStats.Add(local);
+            }
+            if (native != null && !string.IsNullOrWhiteSpace(native.AccountName))
+                local.AccountName = native.AccountName;
+            if (local.LocalPlaySeconds == 0 && local.BaselinePlaySeconds == 0 && native != null)
+                local.BaselinePlaySeconds = native.PlaySeconds;
+            return CopyAccountStats(local);
+        }
+
+        private static GameAccountStats FindAccount(IList<GameAccountStats> accounts, string accountId)
+        {
+            if (accounts == null || string.IsNullOrWhiteSpace(accountId)) return null;
+            foreach (GameAccountStats account in accounts)
+                if (account != null && string.Equals(account.AccountId, accountId, StringComparison.OrdinalIgnoreCase))
+                    return account;
+            return null;
+        }
+
+        private static long AddSeconds(long first, long second)
+        {
+            if (first < 0) first = 0;
+            if (second < 0) second = 0;
+            return second > long.MaxValue - first ? long.MaxValue : first + second;
+        }
+
+        private Game FindLeagueGame()
+        {
+            foreach (Game game in games)
+                if (game.Platform == Platform.Riot &&
+                    string.Equals(game.LaunchTarget, "league_of_legends", StringComparison.OrdinalIgnoreCase))
+                    return game;
+            return null;
+        }
+
+        private GameAccountStats ReadRiotAccount(Game game)
+        {
+            try
+            {
+                string directory = !string.IsNullOrEmpty(game.Executable)
+                    ? Path.GetDirectoryName(game.Executable)
+                    : game.InstallDir;
+                GameAccountStats profile = RiotClientService.ReadCurrentAccount(directory);
+                if (profile != null)
+                {
+                    if (string.IsNullOrEmpty(profile.Region))
+                        profile.Region = RiotApiService.NormalizeRegion(settings.RiotApiRegion);
+                    latestRiotAccount = CopyAccountStats(profile);
+                }
+                return profile;
+            }
+            catch (Exception ex)
+            {
+                Storage.Log("No se pudo leer la cuenta activa de Riot: " + ex.Message);
+                return null;
+            }
+        }
+
+        private bool IsRiotAccountIgnored(string accountId)
+        {
+            if (string.IsNullOrWhiteSpace(accountId)) return false;
+            foreach (string ignored in settings.IgnoredRiotAccounts)
+                if (string.Equals(ignored, accountId, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private List<GameAccountStats> GetKnownRiotAccounts()
+        {
+            Dictionary<string, GameAccountStats> known =
+                new Dictionary<string, GameAccountStats>(StringComparer.OrdinalIgnoreCase);
+            foreach (Game game in games)
+            {
+                if (game.Platform != Platform.Riot) continue;
+                foreach (GameAccountStats account in StateOf(game).AccountStats)
+                {
+                    if (account == null || string.IsNullOrWhiteSpace(account.AccountId) ||
+                        IsRiotAccountIgnored(account.AccountId)) continue;
+                    GameAccountStats current;
+                    if (!known.TryGetValue(account.AccountId, out current) ||
+                        account.UpdatedAt > current.UpdatedAt)
+                        known[account.AccountId] = CopyAccountStats(account);
+                }
+            }
+            return new List<GameAccountStats>(known.Values);
+        }
+
+        private void RefreshKnownRiotAccountsOnline()
+        {
+            if (string.IsNullOrEmpty(settings.RiotApiKeyProtected)) return;
+            foreach (GameAccountStats account in GetKnownRiotAccounts())
+                QueueRiotOnlineLookup(account, true);
+        }
+
+        private void QueueRiotOnlineLookup(GameAccountStats profile, bool force)
+        {
+            if (profile == null || string.IsNullOrWhiteSpace(profile.AccountId) ||
+                IsRiotAccountIgnored(profile.AccountId)) return;
+            if (string.IsNullOrWhiteSpace(settings.RiotApiKeyProtected))
+            {
+                if (!riotApiKeyNoticeShown)
+                {
+                    riotApiKeyNoticeShown = true;
+                    ShowTransientHint("Para nivel y rango online de Riot, configura una clave desde Ajustes.");
+                }
+                return;
+            }
+
+            GameAccountStats known = null;
+            foreach (GameAccountStats account in GetKnownRiotAccounts())
+                if (string.Equals(account.AccountId, profile.AccountId, StringComparison.OrdinalIgnoreCase))
+                { known = account; break; }
+
+            DateTime now = DateTime.UtcNow;
+            if (!force && known != null && known.OnlineUpdatedAt > 0 &&
+                Fmt.ToUnix(now) - known.OnlineUpdatedAt < 30 * 60)
+                return;
+            lock (riotLookupLock)
+            {
+                DateTime attempted;
+                if (lastRiotLookupAttempt.TryGetValue(profile.AccountId, out attempted) &&
+                    !force && now - attempted < TimeSpan.FromMinutes(5)) return;
+                if (!riotLookupsInProgress.Add(profile.AccountId)) return;
+                lastRiotLookupAttempt[profile.AccountId] = now;
+            }
+
+            string key = RiotApiService.UnprotectKey(settings.RiotApiKeyProtected);
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                lock (riotLookupLock) riotLookupsInProgress.Remove(profile.AccountId);
+                return;
+            }
+            GameAccountStats requestProfile = CopyAccountStats(profile);
+            string fallbackRegion = settings.RiotApiRegion;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                GameAccountStats updated = RiotApiService.LookupOnline(requestProfile, key, fallbackRegion);
+                try
+                {
+                    if (IsDisposed || !IsHandleCreated)
+                    {
+                        lock (riotLookupLock) riotLookupsInProgress.Remove(requestProfile.AccountId);
+                        return;
+                    }
+                    BeginInvoke(new Action(delegate
+                    {
+                        lock (riotLookupLock) riotLookupsInProgress.Remove(requestProfile.AccountId);
+                        if (updated == null)
+                        {
+                            ShowTransientHint("No se pudieron actualizar los datos de Riot. Revisa clave, región o conexión.");
+                            return;
+                        }
+                        if (IsRiotAccountIgnored(updated.AccountId)) return;
+
+                        bool changed = false;
+                        foreach (Game game in games)
+                        {
+                            if (game.Platform != Platform.Riot) continue;
+                            GameState state = StateOf(game);
+                            GameAccountStats current = FindAccount(state.AccountStats, updated.AccountId);
+                            if (current == null) continue;
+                            if (updated.Level > 0 && current.Level != updated.Level)
+                            { current.Level = updated.Level; changed = true; }
+                            if (!string.IsNullOrWhiteSpace(updated.Rank) && current.Rank != updated.Rank)
+                            { current.Rank = updated.Rank; changed = true; }
+                            if (!string.IsNullOrWhiteSpace(updated.Region) && current.Region != updated.Region)
+                            { current.Region = updated.Region; changed = true; }
+                            if (updated.OnlineUpdatedAt > current.OnlineUpdatedAt)
+                            { current.OnlineUpdatedAt = updated.OnlineUpdatedAt; changed = true; }
+                        }
+                        if (!changed) return;
+                        SaveSettings();
+                        RefreshGrid();
+                        if (detailsPanel != null)
+                        {
+                            foreach (Game game in games)
+                                if (game.Platform == Platform.Riot &&
+                                    detailsPanel.MatchesGame(game.Id))
+                                {
+                                    GameState state = StateOf(game);
+                                    detailsPanel.UpdateAccountData(GetPlaySeconds(game, state),
+                                        GetAccountStats(game, state));
+                                    break;
+                                }
+                        }
+                    }));
+                }
+                catch (InvalidOperationException)
+                {
+                    lock (riotLookupLock) riotLookupsInProgress.Remove(requestProfile.AccountId);
+                }
+            });
+        }
+
+        private void ShowTransientHint(string text)
+        {
+            hintText.Text = text;
+            statusTimer.Stop();
+            statusTimer.Start();
+        }
+
+        private bool UpdateRiotAccountStats(Game game, GameAccountStats profile, long seconds)
+        {
+            if (game == null || profile == null) return false;
+            string key = string.IsNullOrWhiteSpace(profile.AccountId)
+                ? profile.AccountName : profile.AccountId;
+            if (IsRiotAccountIgnored(key)) return false;
+            GameState state = StateOf(game);
+            GameAccountStats current = null;
+            foreach (GameAccountStats account in state.AccountStats)
+            {
+                if (string.Equals(account.AccountId, key, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(profile.AccountName) &&
+                     string.Equals(account.AccountName, profile.AccountName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    current = account;
+                    break;
+                }
+            }
+
+            bool changed = false;
+            if (current == null)
+            {
+                current = new GameAccountStats();
+                current.AccountId = key;
+                state.AccountStats.Add(current);
+                changed = true;
+            }
+            if (!string.IsNullOrWhiteSpace(profile.AccountName) && current.AccountName != profile.AccountName)
+            {
+                current.AccountName = profile.AccountName;
+                changed = true;
+            }
+            if (!string.IsNullOrWhiteSpace(profile.Rank) && current.Rank != profile.Rank)
+            {
+                current.Rank = profile.Rank;
+                changed = true;
+            }
+            if (profile.Level > 0 && current.Level != profile.Level)
+            {
+                current.Level = profile.Level;
+                changed = true;
+            }
+            if (!string.IsNullOrWhiteSpace(profile.Region) && current.Region != profile.Region)
+            {
+                current.Region = profile.Region;
+                changed = true;
+            }
+            if (seconds > 0)
+            {
+                current.PlaySeconds = AddSeconds(current.PlaySeconds, seconds);
+                state.PlaySeconds = AddSeconds(state.PlaySeconds, seconds);
+                changed = true;
+            }
+            if (profile.UpdatedAt > current.UpdatedAt)
+                current.UpdatedAt = profile.UpdatedAt;
+            if (profile.OnlineUpdatedAt > current.OnlineUpdatedAt)
+                current.OnlineUpdatedAt = profile.OnlineUpdatedAt;
+            return changed;
+        }
+
+        private void RecordGameSession(Game game, long seconds, GameAccountStats account)
+        {
+            if (game.Platform == Platform.Riot && account != null)
+                UpdateRiotAccountStats(game, account, seconds);
+            else if (game.Platform == Platform.Steam && account != null)
+            {
+                GameState state = StateOf(game);
+                GameAccountStats local = FindAccount(state.AccountStats, account.AccountId);
+                if (local == null)
+                {
+                    local = CopyAccountStats(account);
+                    state.AccountStats.Add(local);
+                }
+                local.LocalPlaySeconds = AddSeconds(local.LocalPlaySeconds, seconds);
+                state.PlaySeconds = AddSeconds(state.PlaySeconds, seconds);
+            }
+            else
+            {
+                GameState state = StateOf(game);
+                state.PlaySeconds = AddSeconds(state.PlaySeconds, seconds);
+            }
+        }
+
+        private static GameAccountStats CopyAccountStats(GameAccountStats source)
+        {
+            if (source == null) return null;
+            GameAccountStats copy = new GameAccountStats();
+            copy.AccountId = source.AccountId;
+            copy.AccountName = source.AccountName;
+            copy.PlaySeconds = source.PlaySeconds;
+            copy.BaselinePlaySeconds = source.BaselinePlaySeconds;
+            copy.LocalPlaySeconds = source.LocalPlaySeconds;
+            copy.Rank = source.Rank;
+            copy.Level = source.Level;
+            copy.Region = source.Region;
+            copy.UpdatedAt = source.UpdatedAt;
+            copy.OnlineUpdatedAt = source.OnlineUpdatedAt;
+            return copy;
         }
 
         private void FinalizeSessions()
@@ -1069,10 +1647,42 @@ namespace GamesOfAll
                     if (string.Equals(candidate.Id, pair.Key, StringComparison.OrdinalIgnoreCase)) { g = candidate; break; }
                 if (g == null) continue;
                 long seconds = (long)(now - pair.Value).TotalSeconds;
-                if (seconds >= 15) StateOf(g).PlaySeconds += seconds;
+                if (seconds >= 15)
+                {
+                    GameAccountStats account = null;
+                    if (g.Platform == Platform.Riot)
+                    {
+                        GameAccountStats current = ReadRiotAccount(g);
+                        runningAccounts.TryGetValue(g.Id, out account);
+                        account = MergeRiotSessionAccount(account, current);
+                    }
+                    else if (g.Platform == Platform.Steam)
+                    {
+                        runningSteamAccounts.TryGetValue(g.Id, out account);
+                    }
+                    RecordGameSession(g, seconds, account);
+                    if (g.Platform == Platform.Steam) Scanner.RefreshSteamPlaytimes(games);
+                }
             }
             runningSince.Clear();
+            runningAccounts.Clear();
+            runningSteamAccounts.Clear();
             SaveSettings();
+        }
+
+        private static GameAccountStats MergeRiotSessionAccount(GameAccountStats session, GameAccountStats current)
+        {
+            if (session == null) return CopyAccountStats(current);
+            if (current == null ||
+                !string.Equals(session.AccountId, current.AccountId, StringComparison.OrdinalIgnoreCase))
+                return session;
+            if (!string.IsNullOrWhiteSpace(current.AccountName)) session.AccountName = current.AccountName;
+            if (!string.IsNullOrWhiteSpace(current.Rank)) session.Rank = current.Rank;
+            if (current.Level > 0) session.Level = current.Level;
+            if (!string.IsNullOrWhiteSpace(current.Region)) session.Region = current.Region;
+            if (current.UpdatedAt > session.UpdatedAt) session.UpdatedAt = current.UpdatedAt;
+            if (current.OnlineUpdatedAt > session.OnlineUpdatedAt) session.OnlineUpdatedAt = current.OnlineUpdatedAt;
+            return session;
         }
 
         // ----------------------------------------------------------------- AJUSTES
@@ -1124,6 +1734,7 @@ namespace GamesOfAll
                     topBar.BackColor = Theme.BgSoft;
                     filtersBar.BackColor = Theme.Bg;
                     bottomBar.BackColor = Theme.BgSoft;
+                    if (detailsPanel != null) detailsPanel.ApplyTheme();
                     SaveSettings();
                     RefreshGrid();
                     Invalidate(true);
@@ -1132,6 +1743,8 @@ namespace GamesOfAll
             }
             menu.Items.Add(themeMenu);
             Menus.Item(menu, "Emuladores…", delegate { ShowEmulatorsDialog(); });
+            Menus.Item(menu, "Cuentas de Riot…", delegate { ShowRiotAccounts(); });
+            Menus.Item(menu, "Configurar datos online de Riot…", delegate { ShowRiotApiSettings(); });
             Menus.Item(menu, "Buscar juegos instalados en el PC…", delegate { ShowDiscoveryDialog(); });
             Menus.Item(menu, "Estadísticas de juego…", delegate { ShowStats(); });
             Menus.Item(menu, "Volver a detectar todo", delegate
@@ -1141,16 +1754,97 @@ namespace GamesOfAll
             });
             Menus.Item(menu, "Abrir carpeta de datos", delegate { GameLauncher.OpenFolder(Storage.DataDir); });
             Menus.Separator(menu);
-            Menus.Item(menu, "Acerca de GamesOfAll", delegate
+            Menus.Item(menu, "Acerca de Games", delegate
             {
                 MessageBox.Show(this,
-                    "GamesOfAll 1.0\n\nTu biblioteca unificada de Steam, Epic Games, Riot, juegos locales y emuladores.\n\n" +
-                    "Clic en una tarjeta para jugar.\nClic derecho para más opciones.\n\n" +
+                    "Games 1.0\n\nTu biblioteca unificada de Steam, Epic Games, Riot, juegos locales y emuladores.\n\n" +
+                    "Clic en una tarjeta para ver sus detalles y jugar.\nClic derecho para más opciones.\n\n" +
                     "Datos guardados en:\n" + Storage.DataDir,
-                    "Acerca de GamesOfAll", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "Acerca de Games", MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
 
             menu.Show(settingsButton, new Point(0, settingsButton.Height + Theme.Px(4)));
+        }
+
+        private void ShowRiotApiSettings()
+        {
+            using (RiotApiSettingsDialog dialog =
+                new RiotApiSettingsDialog(settings.RiotApiKeyProtected, settings.RiotApiRegion))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                settings.RiotApiKeyProtected = dialog.ProtectedApiKey;
+                settings.RiotApiRegion = dialog.SelectedRegion;
+                riotApiKeyNoticeShown = false;
+                SaveSettings();
+            }
+            RefreshKnownRiotAccountsOnline();
+        }
+
+        private void ShowRiotAccounts()
+        {
+            List<GameAccountStats> ignored = GetIgnoredRiotAccounts();
+            using (RiotAccountsDialog dialog = new RiotAccountsDialog(
+                GetKnownRiotAccounts(), ignored, RemoveRiotAccount, RestoreRiotAccount))
+                dialog.ShowDialog(this);
+        }
+
+        private List<GameAccountStats> GetIgnoredRiotAccounts()
+        {
+            Dictionary<string, GameAccountStats> ignored =
+                new Dictionary<string, GameAccountStats>(StringComparer.OrdinalIgnoreCase);
+            foreach (Game game in games)
+            {
+                if (game.Platform != Platform.Riot) continue;
+                foreach (GameAccountStats account in StateOf(game).AccountStats)
+                    if (account != null && IsRiotAccountIgnored(account.AccountId) &&
+                        !ignored.ContainsKey(account.AccountId))
+                        ignored[account.AccountId] = CopyAccountStats(account);
+            }
+            foreach (string accountId in settings.IgnoredRiotAccounts)
+            {
+                if (ignored.ContainsKey(accountId)) continue;
+                GameAccountStats account = new GameAccountStats();
+                account.AccountId = accountId;
+                string name;
+                if (settings.IgnoredRiotAccountNames.TryGetValue(accountId, out name))
+                    account.AccountName = name;
+                ignored[accountId] = account;
+            }
+            return new List<GameAccountStats>(ignored.Values);
+        }
+
+        private void RemoveRiotAccount(string accountId)
+        {
+            if (string.IsNullOrWhiteSpace(accountId)) return;
+            GameAccountStats profile = null;
+            foreach (GameAccountStats account in GetKnownRiotAccounts())
+                if (string.Equals(account.AccountId, accountId, StringComparison.OrdinalIgnoreCase))
+                { profile = account; break; }
+
+            if (!IsRiotAccountIgnored(accountId))
+                settings.IgnoredRiotAccounts.Add(accountId);
+            if (profile != null && !string.IsNullOrWhiteSpace(profile.AccountName))
+                settings.IgnoredRiotAccountNames[accountId] = profile.AccountName;
+            SaveSettings();
+            RefreshGrid();
+        }
+
+        private void RestoreRiotAccount(string accountId)
+        {
+            if (string.IsNullOrWhiteSpace(accountId)) return;
+            settings.IgnoredRiotAccounts.RemoveAll(delegate(string ignored)
+            {
+                return string.Equals(ignored, accountId, StringComparison.OrdinalIgnoreCase);
+            });
+            settings.IgnoredRiotAccountNames.Remove(accountId);
+            SaveSettings();
+            RefreshGrid();
+            foreach (GameAccountStats account in GetKnownRiotAccounts())
+                if (string.Equals(account.AccountId, accountId, StringComparison.OrdinalIgnoreCase))
+                {
+                    QueueRiotOnlineLookup(account, true);
+                    break;
+                }
         }
 
         private void SaveSettings()
@@ -1185,12 +1879,18 @@ namespace GamesOfAll
 
         private void ShowEmulatorsDialog()
         {
-            using (EmulatorsDialog dlg = new EmulatorsDialog(settings.Emulators))
+            EnsureEmulatorIds();
+            List<EmulatorConfig> edited = new List<EmulatorConfig>();
+            foreach (EmulatorConfig emulator in settings.Emulators)
+                edited.Add(CloneEmulator(emulator));
+            using (EmulatorsDialog dlg = new EmulatorsDialog(edited))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                settings.Emulators = dlg.Emulators;
+                EnsureEmulatorIds();
                 int added = ScanEmulatorGames();
                 SaveSettings();
-                RefreshGrid();
+                SetFilter("Emulated");
                 hintText.Text = added == 0
                     ? "Configuración de emuladores guardada."
                     : (added == 1 ? "1 juego emulado añadido." : added + " juegos emulados añadidos.");
@@ -1232,11 +1932,30 @@ namespace GamesOfAll
                     if (AddLocalGame(title, emulator.ExePath,
                         string.IsNullOrEmpty(emulator.Arguments) ? "{rom}" : emulator.Arguments,
                         Path.GetDirectoryName(emulator.ExePath), GameKind.Emulated, rom,
-                        string.IsNullOrEmpty(emulator.Name) ? "Emulado" : emulator.Name))
+                        string.IsNullOrEmpty(emulator.Name) ? "Emulado" : emulator.Name, emulator.Id))
                         added++;
                 }
             }
             return added;
+        }
+
+        private void EnsureEmulatorIds()
+        {
+            foreach (EmulatorConfig emulator in settings.Emulators)
+                if (emulator != null && string.IsNullOrEmpty(emulator.Id))
+                    emulator.Id = Guid.NewGuid().ToString("N");
+        }
+
+        private static EmulatorConfig CloneEmulator(EmulatorConfig source)
+        {
+            EmulatorConfig clone = new EmulatorConfig();
+            clone.Id = source.Id;
+            clone.Name = source.Name;
+            clone.ExePath = source.ExePath;
+            clone.RomFolder = source.RomFolder;
+            clone.Arguments = source.Arguments;
+            clone.Extensions = source.Extensions;
+            return clone;
         }
 
         private void RestoreWindowPosition()
@@ -1379,6 +2098,23 @@ namespace GamesOfAll
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
+            if (detailsPanel != null)
+            {
+                if (keyData == Keys.Escape) { CloseGameDetails(); return true; }
+                if (keyData == (Keys.Control | Keys.F))
+                {
+                    CloseGameDetails();
+                    search.FocusInput();
+                    return true;
+                }
+                if (keyData == (Keys.Control | Keys.N))
+                {
+                    CloseGameDetails();
+                    AddGameDialogFlow();
+                    return true;
+                }
+                return base.ProcessCmdKey(ref msg, keyData);
+            }
             if (keyData == (Keys.Control | Keys.F)) { search.FocusInput(); return true; }
             if (keyData == (Keys.Control | Keys.N)) { AddGameDialogFlow(); return true; }
 
@@ -1421,8 +2157,8 @@ namespace GamesOfAll
         private void ActivateSelected()
         {
             int index = SelectedIndex();
-            if (index >= 0 && index < grid.Cards.Count) Launch(grid.Cards[index].Game);
-            else if (grid.Cards.Count > 0) Launch(grid.Cards[0].Game);
+            if (index >= 0 && index < grid.Cards.Count) ShowGameDetails(grid.Cards[index].Game);
+            else if (grid.Cards.Count > 0) ShowGameDetails(grid.Cards[0].Game);
         }
 
         protected override void WndProc(ref Message m)

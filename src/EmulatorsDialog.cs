@@ -15,6 +15,8 @@ namespace GamesOfAll
         private readonly TextBox arguments;
         private readonly TextBox extensions;
 
+        public List<EmulatorConfig> Emulators { get { return emulators; } }
+
         public EmulatorsDialog(List<EmulatorConfig> emulators)
         {
             this.emulators = emulators ?? new List<EmulatorConfig>();
@@ -152,6 +154,7 @@ namespace GamesOfAll
         private void AddEmulator(object sender, EventArgs e)
         {
             EmulatorConfig emulator = new EmulatorConfig();
+            emulator.Id = Guid.NewGuid().ToString("N");
             emulator.Name = "Nuevo emulador";
             emulators.Add(emulator);
             RefreshList();

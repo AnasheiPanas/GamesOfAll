@@ -8,23 +8,18 @@ using System.Windows.Forms;
 namespace GamesOfAll
 {
     // Contenedor con barra de desplazamiento propia (oscura) y rejilla adaptable.
-    internal sealed class GridPanel : Control
+    internal sealed class GridPanel : ScrollableControl
     {
         public readonly List<GameCard> Cards = new List<GameCard>();
         public string EmptyText = "";
         public string EmptyHint = "";
 
-        private int scroll;
         private int contentHeight;
         private int cardW = 160;
         private int cardH = 240;
         private int columns = 1;
         private int pad;
         private int gap;
-        private Rectangle thumbRect;
-        private bool barDragging;
-        private bool barHover;
-        private int barGrabOffset;
         private Image ambientImage;
 
         public GridPanel()
@@ -33,6 +28,9 @@ namespace GamesOfAll
                      ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             DoubleBuffered = true;
             BackColor = Theme.Bg;
+            AutoScroll = true;
+            HorizontalScroll.Enabled = false;
+            HorizontalScroll.Visible = false;
         }
 
         public int Columns { get { return columns; } }
@@ -74,7 +72,7 @@ namespace GamesOfAll
             foreach (GameCard c in Cards) Controls.Add(c);
             ResumeLayout();
 
-            scroll = 0;
+            AutoScrollPosition = Point.Empty;
             Relayout();
         }
 
@@ -99,19 +97,14 @@ namespace GamesOfAll
 
             int rows = (Cards.Count + columns - 1) / columns;
             contentHeight = pad * 2 + rows * cardH + Math.Max(0, rows - 1) * gap;
-
-            ClampScroll();
+            AutoScrollMinSize = new Size(0, contentHeight);
+            AutoScrollPosition = new Point(0, Math.Min(CurrentScroll, MaxScroll));
             PositionCards();
             Invalidate();
         }
 
-        private int MaxScroll { get { return Math.Max(0, contentHeight - Height); } }
-
-        private void ClampScroll()
-        {
-            if (scroll > MaxScroll) scroll = MaxScroll;
-            if (scroll < 0) scroll = 0;
-        }
+        private int MaxScroll { get { return Math.Max(0, contentHeight - ClientSize.Height); } }
+        private int CurrentScroll { get { return Math.Max(0, -AutoScrollPosition.Y); } }
 
         private void PositionCards()
         {
@@ -119,17 +112,15 @@ namespace GamesOfAll
             {
                 int col = i % columns;
                 int row = i / columns;
-                Cards[i].SetBounds(pad + col * (cardW + gap), pad + row * (cardH + gap) - scroll, cardW, cardH);
+                Cards[i].SetBounds(pad + col * (cardW + gap), pad + row * (cardH + gap), cardW, cardH);
             }
         }
 
         public void ScrollBy(int delta)
         {
             if (MaxScroll <= 0) return;
-            scroll += delta;
-            ClampScroll();
-            PositionCards();
-            Invalidate();
+            int target = Math.Max(0, Math.Min(MaxScroll, CurrentScroll + delta));
+            AutoScrollPosition = new Point(0, target);
         }
 
         public void EnsureVisible(int index)
@@ -139,13 +130,12 @@ namespace GamesOfAll
             int logicalTop = pad + row * (cardH + gap);
             int logicalBottom = logicalTop + cardH;
 
+            int scroll = CurrentScroll;
             if (logicalTop - scroll < pad - Theme.Px(2)) scroll = logicalTop - pad;
-            else if (logicalBottom - scroll > Height - pad) scroll = logicalBottom - Height + pad;
+            else if (logicalBottom - scroll > ClientSize.Height - pad) scroll = logicalBottom - ClientSize.Height + pad;
             else return;
 
-            ClampScroll();
-            PositionCards();
-            Invalidate();
+            AutoScrollPosition = new Point(0, Math.Max(0, Math.Min(MaxScroll, scroll)));
         }
 
         protected override void OnResize(EventArgs e)
@@ -167,21 +157,6 @@ namespace GamesOfAll
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             ScrollBy(e.Delta > 0 ? -Theme.Px(150) : Theme.Px(150));
-            base.OnMouseWheel(e);
-        }
-
-        private Rectangle ComputeThumb()
-        {
-            if (MaxScroll <= 0) return Rectangle.Empty;
-            int trackTop = Theme.Px(18);
-            int trackH = Height - Theme.Px(36);
-            if (trackH < Theme.Px(60)) return Rectangle.Empty;
-
-            int thumbH = Math.Max(Theme.Px(44), (int)((float)trackH * Height / contentHeight));
-            if (thumbH > trackH) thumbH = trackH;
-            int travel = trackH - thumbH;
-            int y = trackTop + (int)(travel * ((float)scroll / MaxScroll));
-            return new Rectangle(Width - Theme.Px(11), y, Theme.Px(5), thumbH);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -205,13 +180,6 @@ namespace GamesOfAll
                     g.FillRectangle(tint, ClientRectangle);
             }
 
-            thumbRect = ComputeThumb();
-            if (thumbRect != Rectangle.Empty)
-            {
-                int alpha = (barHover || barDragging) ? 120 : 55;
-                Theme.FillRound(g, thumbRect, thumbRect.Width / 2f, Color.FromArgb(alpha, 200, 212, 230));
-            }
-
             if (Cards.Count == 0 && !string.IsNullOrEmpty(EmptyText))
             {
                 int centerY = Height / 2 - Theme.Px(30);
@@ -224,51 +192,5 @@ namespace GamesOfAll
             }
         }
 
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left && thumbRect.Contains(e.Location))
-            {
-                barDragging = true;
-                barGrabOffset = e.Y - thumbRect.Y;
-                Invalidate();
-                return;
-            }
-            base.OnMouseDown(e);
-        }
-
-        protected override void OnMouseMove(MouseEventArgs e)
-        {
-            bool over = thumbRect != Rectangle.Empty && thumbRect.Contains(e.Location);
-            if (over != barHover) { barHover = over; Cursor = over ? Cursors.Hand : Cursors.Default; Invalidate(); }
-
-            if (barDragging)
-            {
-                int trackTop = Theme.Px(18);
-                int trackH = Height - Theme.Px(36);
-                int track = trackH - thumbRect.Height;
-                if (track > 0)
-                {
-                    int relative = e.Y - barGrabOffset - trackTop;
-                    relative = Math.Max(0, Math.Min(track, relative));
-                    scroll = (int)((float)relative / track * MaxScroll);
-                    ClampScroll();
-                    PositionCards();
-                    Invalidate();
-                }
-            }
-            base.OnMouseMove(e);
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            if (barDragging) { barDragging = false; Invalidate(); }
-            base.OnMouseUp(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            if (barHover) { barHover = false; Invalidate(); }
-            base.OnMouseLeave(e);
-        }
     }
 }

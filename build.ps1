@@ -1,4 +1,4 @@
-﻿# Compila GamesOfAll.exe (WinForms sobre .NET Framework, sin dependencias externas).
+# Compila Games.exe (WinForms sobre .NET Framework, sin dependencias externas).
 param(
     [switch]$Run,
     [switch]$Shortcut
@@ -21,7 +21,7 @@ $sources = @(Get-ChildItem (Join-Path $root "src") -Filter *.cs |
     ForEach-Object { $_.FullName })
 if ($sources.Count -eq 0) { throw "No hay archivos .cs en src." }
 
-$exe = Join-Path $root "GamesOfAll.exe"
+$exe = Join-Path $root "Games.exe"
 $manifest = Join-Path $root "assets\app.manifest"
 
 $cscArgs = @(
@@ -37,7 +37,8 @@ $cscArgs = @(
     "/r:System.Core.dll",
     "/r:System.Windows.Forms.dll",
     "/r:System.Drawing.dll",
-    "/r:System.Web.Extensions.dll"
+    "/r:System.Web.Extensions.dll",
+    "/r:System.Security.dll"
 )
 if (Test-Path $icon) { $cscArgs += "/win32icon:$icon" }
 $cscArgs += $sources
@@ -50,12 +51,12 @@ Write-Host "Listo: $exe" -ForegroundColor Green
 
 if ($Shortcut) {
     $ws = New-Object -ComObject WScript.Shell
-    $lnkPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "GamesOfAll.lnk"
+    $lnkPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "Games.lnk"
     $lnk = $ws.CreateShortcut($lnkPath)
     $lnk.TargetPath = $exe
     $lnk.WorkingDirectory = $root
     $lnk.IconLocation = $exe
-    $lnk.Description = "GamesOfAll - tu biblioteca de juegos"
+    $lnk.Description = "Games - tu biblioteca de juegos"
     $lnk.Save()
     Write-Host "Acceso directo creado en el escritorio." -ForegroundColor Green
 }
